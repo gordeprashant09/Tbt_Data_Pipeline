@@ -413,9 +413,15 @@ def run_sanity_checks(final_files: dict, row_count_csv: Path, output_root: Path,
 
     all_passed    = True
     parquet_total = 0
+    csv_rows      = []
 
-    csv_rows = []
+    # ── Cache: (inst, expiry, symbol) -> row_count ────────────────────────
+    # Populated during the per-file loop below; reused everywhere after that.
+    # This avoids re-reading parquet metadata multiple times for summaries,
+    # CSV writing, etc. — zero extra I/O after the first pass.
+    row_count_cache: dict[tuple, int] = {}
 
+    # ── Per-file checks ───────────────────────────────────────────────────
     for inst in sorted(INSTRUMENTS):
         for expiry, symbols in sorted(final_files[inst].items()):
             for symbol, path in sorted(symbols.items()):
@@ -435,8 +441,14 @@ def run_sanity_checks(final_files: dict, row_count_csv: Path, output_root: Path,
                     else:
                         print(f"  [PASS] magic bytes  PAR1 ok")
 
-                    meta  = pq.read_metadata(path)
-                    rows  = sum(meta.row_group(i).num_rows for i in range(meta.num_row_groups))
+                    # Single pq.read_metadata() call — result stored in cache
+                    meta = pq.read_metadata(path)
+                    rows = sum(
+                        meta.row_group(i).num_rows
+                        for i in range(meta.num_row_groups)
+                    )
+                    row_count_cache[(inst, expiry, symbol)] = rows  # ← cache here
+
                     if rows == 0:
                         print(f"  [FAIL] row count = 0")
                         all_passed = False
@@ -472,20 +484,21 @@ def run_sanity_checks(final_files: dict, row_count_csv: Path, output_root: Path,
                     status,
                 ])
 
+    # ── ROW COUNT SUMMARY — read from cache, zero disk I/O ───────────────
     print(f"\n{'─' * 65}")
     print("  ROW COUNT SUMMARY PER INSTRUMENT")
     print(f"{'─' * 65}")
     for inst in sorted(INSTRUMENTS):
         inst_total = sum(
-            sum(pq.read_metadata(p).row_group(i).num_rows
-                for i in range(pq.read_metadata(p).num_row_groups))
-            for symbols in final_files[inst].values()
-            for p in symbols.values()
+            count
+            for (i, _e, _s), count in row_count_cache.items()
+            if i == inst
         )
         print(f"  {inst:10s} : {inst_total:>15,} rows")
     print(f"  {'─' * 45}")
     print(f"  {'TOTAL':10s} : {parquet_total:>15,} rows  (FUTSTK+FUTIDX+OPTSTK+OPTIDX)")
 
+    # ── CROSS-CHECK ───────────────────────────────────────────────────────
     print(f"\n{'─' * 65}")
     print("  ROW COUNT CROSS-CHECK  (.cap parser CSV vs parquet)")
     print(f"{'─' * 65}")
@@ -532,6 +545,7 @@ def run_sanity_checks(final_files: dict, row_count_csv: Path, output_root: Path,
     print("[SANITY] ALL PASSED ✓" if all_passed else "[SANITY] SOME CHECKS FAILED — review above")
     print(f"{'=' * 65}")
 
+    # ── Write sanity CSV — read from cache, zero disk I/O ────────────────
     sanity_csv = output_root / f"sanity_check_{date}.csv"
     import csv as _csv
     try:
@@ -546,10 +560,9 @@ def run_sanity_checks(final_files: dict, row_count_csv: Path, output_root: Path,
             w.writerow(["── ROW COUNT SUMMARY PER INSTRUMENT ──"])
             for inst in sorted(INSTRUMENTS):
                 inst_total = sum(
-                    sum(pq.read_metadata(p).row_group(i).num_rows
-                        for i in range(pq.read_metadata(p).num_row_groups))
-                    for symbols in final_files[inst].values()
-                    for p in symbols.values()
+                    count
+                    for (i, _e, _s), count in row_count_cache.items()
+                    if i == inst
                 )
                 w.writerow([inst, "", "", "", "", inst_total, "", ""])
             w.writerow(["TOTAL", "", "", "", "", parquet_total,
