@@ -702,28 +702,15 @@ def publish_to_nas(final_files: dict, row_count_csv: Path,
 
 
 # ---------------------------------------------------------------------------
-# Publish to NAS — /mnt/historical_data/parsed_data
-# All 4 instruments + sanity CSV + support_docs (no change)
+# Publish to NAS — /mnt/historical_data/parsed_data/<date>
+# Only sanity CSV + support_docs (parquet files go via tar bundle instead)
 # ---------------------------------------------------------------------------
 def publish_to_parsed_nas(final_files: dict, row_count_csv: Path,
                            output_root: Path, date: str):
     nas_root = PARSED_DATA_NAS / date
-    print(f"\n[NAS PUBLISH] Publishing to {nas_root} ...")
+    print(f"\n[NAS PUBLISH] Publishing support files to {nas_root} ...")
 
     nas_root.mkdir(parents=True, exist_ok=True)
-
-    # ── Parquet files — all 4 instruments ─────────────────────────────────
-    tasks = []
-    for inst, expiry_symbols in final_files.items():
-        for expiry, symbols in expiry_symbols.items():
-            for symbol, path in symbols.items():
-                out_dir = nas_root / inst / symbol
-                out_dir.mkdir(parents=True, exist_ok=True)
-                tasks.append((str(path), out_dir))
-
-    with ThreadPoolExecutor(max_workers=PUBLISH_WORKERS) as ex:
-        for fname in ex.map(_publish_one, tasks):
-            print(f"  [NAS PUBLISH] {fname}")
 
     # ── Row count CSV ──────────────────────────────────────────────────────
     if row_count_csv.exists():
@@ -755,20 +742,29 @@ def publish_to_parsed_nas(final_files: dict, row_count_csv: Path,
     else:
         print(f"  [WARN] support_docs/ not found at {support_src} — skipping")
 
+    # NOTE: parquet files (FUTSTK/FUTIDX/OPTSTK/OPTIDX) are NOT copied
+    # file-by-file here — they are bundled in <date>_parsed.tar by
+    # tar_and_publish() which runs after this function.
     print(f"[NAS PUBLISH] Done -> {nas_root}")
 
 
 # ---------------------------------------------------------------------------
-# TAR bundle — create single .tar of final dir, upload to local + NAS
-# Runs AFTER existing publish_to_nas / publish_to_parsed_nas (no logic changed)
+# ---------------------------------------------------------------------------
+# TAR bundle — create single .tar of final dir, upload to NAS only
+# Local shared gets individual files via publish_to_nas (FUTSTK/FUTIDX only)
+# NAS gets single tar with all 4 instruments (no file-by-file copy to NAS)
 # Benchmark: ~2x faster than file-by-file copy over CIFS/SMB on 1Gbps NAS
 # ---------------------------------------------------------------------------
 def tar_and_publish(final_dir: Path, output_root: Path, date: str):
     """
     Bundle the entire final/<date> directory into a single .tar file
-    and copy it to:
-      - Local shared : /media/svipl/Data/shared/<date>/<date>_parsed.tar
-      - NAS          : /mnt/historical_data/tbt_data/parsed_data/<date>/<date>_parsed.tar
+    and copy it to NAS only:
+      - NAS : /mnt/historical_data/tbt_data/parsed_data/<date>/<date>_parsed.tar
+
+    Local shared path gets individual files via publish_to_nas():
+      - /media/svipl/Data/shared/<date>/FUTSTK/  (file by file)
+      - /media/svipl/Data/shared/<date>/FUTIDX/  (file by file)
+      - No tar on shared path
 
     Why tar (no compression):
       - Parquet files are already zstd-compressed — re-compressing saves <2%
@@ -777,48 +773,52 @@ def tar_and_publish(final_dir: Path, output_root: Path, date: str):
     """
     import time as _time
 
-    tar_name     = f"{date}_parsed.tar"
-    tar_local    = output_root / tar_name                      # local shared
-    tar_nas      = PARSED_DATA_NAS / date / tar_name           # NAS parsed_data
+    tar_name  = f"{date}_parsed.tar"
+    tar_nas   = PARSED_DATA_NAS / date / tar_name   # NAS only
+
+    # Use a temp location to build the tar before pushing to NAS
+    tar_tmp   = output_root / tar_name
 
     print(f"\n{'=' * 65}")
     print(f"[TAR PUBLISH] Bundling final dir → {tar_name}")
     print(f"[TAR PUBLISH] Source  : {final_dir}")
-    print(f"[TAR PUBLISH] Local   : {tar_local}")
     print(f"[TAR PUBLISH] NAS     : {tar_nas}")
     print(f"{'=' * 65}")
 
-    # ── Step 1: create tar locally ────────────────────────────────────────
+    # ── Step 1: create tar in local temp (output_root) ────────────────────
     t0 = _time.time()
     print(f"[TAR PUBLISH] Creating tar archive ...")
     subprocess.run(
-        ["tar", "-cf", str(tar_local), "-C", str(final_dir.parent), final_dir.name],
+        ["tar", "-cf", str(tar_tmp), "-C", str(final_dir.parent), final_dir.name],
         check=True,
     )
-    tar_size_gb = tar_local.stat().st_size / 1e9
+    tar_size_gb = tar_tmp.stat().st_size / 1e9
     elapsed     = _time.time() - t0
-    print(f"[TAR PUBLISH] Created  : {tar_local.name}  "
+    print(f"[TAR PUBLISH] Created  : {tar_name}  "
           f"({tar_size_gb:.2f} GB)  in {elapsed:.1f}s")
 
-    # ── Step 2: copy tar to NAS ───────────────────────────────────────────
+    # ── Step 2: copy tar to NAS (atomic write) ────────────────────────────
     nas_date_dir = PARSED_DATA_NAS / date
     nas_date_dir.mkdir(parents=True, exist_ok=True)
 
     t1 = _time.time()
     print(f"[TAR PUBLISH] Copying to NAS ...")
     tmp_nas = nas_date_dir / (tar_name + ".part")
-    shutil.copy2(tar_local, tmp_nas)
+    shutil.copy2(tar_tmp, tmp_nas)
     os.replace(tmp_nas, tar_nas)
     elapsed_nas = _time.time() - t1
     speed_nas   = tar_size_gb / elapsed_nas * 1000  # MB/s
     print(f"[TAR PUBLISH] NAS done : {tar_nas.name}  "
           f"in {elapsed_nas:.1f}s  ({speed_nas:.1f} MB/s)")
 
-    # ── Step 3: summary ───────────────────────────────────────────────────
+    # ── Step 3: remove local temp tar (not needed on shared) ─────────────
+    tar_tmp.unlink()
+    print(f"[TAR PUBLISH] Temp tar removed from local")
+
+    # ── Step 4: summary ───────────────────────────────────────────────────
     total = _time.time() - t0
     print(f"\n[TAR PUBLISH] Complete in {total:.1f}s total")
-    print(f"  Local : {tar_local}  ({tar_size_gb:.2f} GB)")
-    print(f"  NAS   : {tar_nas}  ({tar_size_gb:.2f} GB)")
+    print(f"  NAS : {tar_nas}  ({tar_size_gb:.2f} GB)")
     print(f"  Extract with: tar -xf {tar_name}")
     print(f"{'=' * 65}")
 
@@ -941,15 +941,14 @@ def main():
     if passed:
         print(f"\n[SUCCESS] {date} extraction complete.")
         print(f"[SHARED]  {output_root}")
-        print(f"          +-- FUTSTK/ FUTIDX/  (OPTSTK & OPTIDX skipped)")
+        print(f"          +-- FUTSTK/                    (file by file)")
+        print(f"          +-- FUTIDX/                    (file by file)")
         print(f"          +-- support_docs/")
         print(f"          +-- sanity_check_{date}.csv")
-        print(f"          +-- {date}_parsed.tar  (all 4 instruments bundled)")
         print(f"[NAS]     {PARSED_DATA_NAS / date}")
-        print(f"          +-- FUTSTK/ FUTIDX/ OPTSTK/ OPTIDX/")
+        print(f"          +-- {date}_parsed.tar           (all 4 instruments)")
         print(f"          +-- support_docs/")
         print(f"          +-- sanity_check_{date}.csv")
-        print(f"          +-- {date}_parsed.tar  (all 4 instruments bundled)")
     else:
         sys.exit("\n[FAILED] Sanity checks failed — review output above.")
 
